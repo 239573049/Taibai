@@ -1,31 +1,12 @@
 ﻿using System.Net;
 using System.Net.Security;
-using System.Net.Sockets;
 using Taibai.Core;
-using HttpMethod = System.Net.Http.HttpMethod;
 
 namespace Taibai.Client;
 
-
-public class Client
+public class Client(string server)
 {
-    private readonly ClientOption option;
-
-    private string Protocol = "taibai";
-    private readonly HttpMessageInvoker httpClient;
-    private readonly Socket socket;
-
-    public Client(ClientOption option)
-    {
-        this.option = option;
-        this.httpClient = new HttpMessageInvoker(CreateDefaultHttpHandler(), true);
-
-        this.socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
-
-        // 监听本地端口
-        this.socket.Bind(new IPEndPoint(IPAddress.Loopback, 60112));
-        this.socket.Listen(10);
-    }
+    private readonly HttpMessageInvoker httpClient = new(CreateDefaultHttpHandler(), true);
 
     private static SocketsHttpHandler CreateDefaultHttpHandler()
     {
@@ -33,81 +14,49 @@ public class Client
         {
             // 允许多个http2连接
             EnableMultipleHttp2Connections = true,
+            // 设置连接超时时间
             ConnectTimeout = TimeSpan.FromSeconds(60),
-            ResponseDrainTimeout = TimeSpan.FromSeconds(60),  
             SslOptions = new SslClientAuthenticationOptions
             {
                 // 由于我们没有证书，所以我们需要设置为true
-                RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true,
+                RemoteCertificateValidationCallback = (_, _, _, _) => true,
             },
         };
     }
 
-    public async Task TransportAsync(CancellationToken cancellationToken)
+
+    public async Task<Stream> HttpConnectServerCoreAsync(string clientId, CancellationToken cancellationToken)
     {
-        Console.WriteLine("Listening on 60112");
-
-        // 等待客户端连接
-        var client = await this.socket.AcceptAsync(cancellationToken);
-
-        Console.WriteLine("Accepted connection from " + client.RemoteEndPoint);
-
-        try
-        {
-            // 将Socket转换为流
-            var stream = new NetworkStream(client);
-
-            // 创建服务器的连接,然后返回一个流, 这个是H2的流
-            var serverStream = await this.CreateServerConnectionAsync(cancellationToken);
-
-            Console.WriteLine("Connected to server");
-
-            // 将两个流连接起来, 这样我们就可以进行双工通信了. 它们会自动进行数据的传输.
-            await Task.WhenAll(
-                stream.CopyToAsync(serverStream, cancellationToken),
-                serverStream.CopyToAsync(stream, cancellationToken)
-            );
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e);
-            throw;
-        }
+        return new SafeWriteStream(await this.Http20ConnectServerAsync(clientId, cancellationToken));
     }
 
     /// <summary>
-    /// 创建与服务器的连接
-    /// </summary> 
+    /// 创建http2连接
+    /// </summary>
     /// <param name="cancellationToken"></param>
-    /// <exception cref="OperationCanceledException"></exception>
     /// <returns></returns>
-    public async Task<SafeWriteStream> CreateServerConnectionAsync(CancellationToken cancellationToken)
+    private async Task<Stream> Http20ConnectServerAsync(string clientId, CancellationToken cancellationToken)
     {
-        var stream = await this.Http20ConnectServerAsync(cancellationToken);
-        return new SafeWriteStream(stream);
-    }
-
-    private async Task<Stream> Http20ConnectServerAsync(CancellationToken cancellationToken)
-    {
-        var serverUri = new Uri(option.ServiceUri);
-        // 这里我们使用Connect方法, 因为我们需要建立一个双工流
+        var serverUri = new Uri($"{server}/client?clientId=" + clientId);
+        // 这里我们使用Connect方法，因为我们需要建立一个双工流, 这样我们就可以进行双工通信了。
         var request = new HttpRequestMessage(HttpMethod.Connect, serverUri);
-
-        // 由于我们设置了Connect方法, 所以我们需要设置协议，这样服务器才能识别
-        request.Headers.Protocol = Protocol;
-        // 设置http2版本
+        // 如果设置了Connect，那么我们需要设置Protocol
+        request.Headers.Protocol = Constant.Protocol;
+        // 我们需要设置http2的版本
         request.Version = HttpVersion.Version20;
-        // 强制使用http2
+
+        // 我们需要确保我们的请求是http2的
         request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
 
+        // 设置一下超时时间，这样我们就可以在超时的时候取消连接了。
         using var timeoutTokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         using var linkedTokenSource =
             CancellationTokenSource.CreateLinkedTokenSource(timeoutTokenSource.Token, cancellationToken);
 
-        // 发送请求，等待服务器验证。
+        // 发送请求，然后等待响应
         var httpResponse = await this.httpClient.SendAsync(request, linkedTokenSource.Token);
 
-        // 返回一个流
+        // 返回h2的流，用于传输数据
         return await httpResponse.Content.ReadAsStreamAsync(linkedTokenSource.Token);
     }
 }
